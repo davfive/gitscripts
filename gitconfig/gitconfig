@@ -1,5 +1,5 @@
 [include]
-    path = ~/gitscripts/gitconfig/gitconfig-setdefault-posix
+    path = ~/gitscripts/gitconfig/gitconfig-setdefault-sh
 
 # Session-level overrides: set GITSCRIPTS_SHELL in the shell that invokes git.
 [includeIf "env:GITSCRIPTS_SHELL=pwsh"]
