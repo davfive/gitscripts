@@ -1,0 +1,9 @@
+# Ignore per-user untracked scripts and editor/temp files
+/user-scripts-untracked
+
+# Standard ignores
+.DS_Store
+*.swp
+*~
+.vscode/
+*.log

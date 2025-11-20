@@ -1,0 +1,14 @@
+[include]
+    path = ~/gitscripts/gitconfig/gitconfig-aliases-posix
+
+# Session-level overrides: set GITSCRIPTS_SHELL in the shell that invokes git.
+[includeIf "env:GITSCRIPTS_SHELL=pwsh"]
+    path = ~/gitscripts/gitconfig/gitconfig-aliases-pwsh
+[includeIf "env:GITSCRIPTS_SHELL=cmd"]
+    path = ~/gitscripts/gitconfig/gitconfig-aliases-cmd
+
+# Windows-specific fragments (optional)
+[includeIf "env:OS=Windows_NT"]
+    path = ~/gitscripts/gitconfig/gitconfig-aliases-windows
+[includeIf "env:GITSCRIPTS_SHELL=pwsh && env:OS=Windows_NT"]
+    path = ~/gitscripts/gitconfig/gitconfig-aliases-windows-pwsh
