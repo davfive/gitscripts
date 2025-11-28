@@ -3,9 +3,9 @@
 # rewrite-authors.sh
 #
 # Purpose:
-#   Rewrite git history replacing any author or committer whose name matches one
-#   of the comma-separated names supplied via --from with a single target
-#   identity (--to-name / --to-email).
+#   Rewrite git history replacing any author or committer whose identity matches
+#   one of the selectors supplied via --from with a single target identity
+#   (--to-name / --to-email).
 #
 # WARNING — Impact of history rewrite:
 #   - Commit SHAs: all rewritten commits (and descendants) get NEW SHAs.
@@ -27,75 +27,130 @@
 #     main                  commits reachable from branch main
 #     main ^feature         commits in main excluding those in feature
 #
-# Why filter-branch (vs filter-repo):
-#   - Built-in, no external dependency.
-#   - Predictable for modest repository sizes.
-#
-# Options:
-#   --from "Name A,Name B,..."   (required) exact names to rewrite
-#   --to-name NEW_NAME           (required) replacement author/committer name
-#   --to-email NEW_EMAIL         (required) replacement email
+# Options (ALL required except --backup-dir):
+#   --from "<selector>[,<selector>...]"  selectors to rewrite; each selector may be:
+#       - Name
+#       - email@example.com
+#       - Name <email@example.com>
+#   --to-name NEW_NAME           replacement author/committer name
+#   --to-email NEW_EMAIL         replacement email
 #   --backup-dir PATH            (optional) override backup mirror directory
+#   --preview                    show matching commits only; no rewrite performed
 #
-# Backup:
-#   If --backup-dir not provided, a mirror is created at:
-#       ../<repo>.rewrite-backup.<n>
-#   where <n> is the first unused positive integer.
+# Backup (if --backup-dir omitted):
+#   ../<repo>.rewrite-backup.<n>  first unused positive integer n.
 #
-# Full history example:
-#   bash scripts/rewrite-authors.sh \
-#     --from "David May,David" \
-#     --to-name davfive \
-#     --to-email davfive@gmail.com
-#
-# Range-limited example (post v3.0.0-alpha only):
-#   bash scripts/rewrite-authors.sh \
-#     --from "David May" \
-#     --to-name davfive \
-#     --to-email davfive@gmail.com \
-#     v3.0.0-alpha..
+# Examples:
+#   Full history:
+#     bash scripts/rewrite-authors.sh --from "David May,david@example.com" --to-name davfive --to-email davfive@gmail.com
+#   Range-limited:
+#     bash scripts/rewrite-authors.sh --from "David May <david@example.com>" --to-name davfive --to-email davfive@gmail.com v3.0.0-alpha..
 #
 # Afterward (manual push):
 #   git push --force-with-lease origin main --tags
 # -----------------------------------------------------------------------------
-set -euxo pipefail
+set -euo pipefail
+
+# Scoped verbose executor
+runx() { ( set -x; "$@" ); }
+
+usage() {
+  cat >&2 <<'EOF'
+*** This operation rewrites history; review script header warnings. ***
+
+Usage:
+  rewrite-authors.sh --from "sel1,sel2" --to-name NEW_NAME --to-email NEW_EMAIL [--backup-dir PATH] [--preview] [<rev/range> ...]
+
+--from selectors:
+  Each selector may be a Name, an email, or "Name <email>"
+
+Required:
+  --from        Comma-separated selectors to match (name/email)
+  --to-name     Replacement name
+  --to-email    Replacement email
+
+Optional:
+  --backup-dir  Override backup directory (default ../<repo>.rewrite-backup.<n>)
+  --preview     Show matching commits only; do not rewrite
+
+Positional revision/range specs (optional):
+  Examples: v1.0.0..  tagA..tagB  A..B  main  main ^feature
+
+Afterward (manual push):
+  git push --force-with-lease origin main --tags
+EOF
+  exit 2
+}
 
 # Globals
-FROM_NAMES=""
+FROM_NAMES=""        # raw --from value
 TO_NAME=""
 TO_EMAIL=""
 BACKUP_DIR=""
-FROM_LIST=""
+FROM_LIST=""         # newline-delimited names extracted from --from
+FROM_EMAIL_LIST=""   # newline-delimited emails extracted from --from
 RANGE_SPECS=()
+PREVIEW=0
 
 parse_args() {
+  [[ $# -eq 0 ]] && usage
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --from)       FROM_NAMES="$2"; shift 2 ;;
-      --to-name)    TO_NAME="$2"; shift 2 ;;
-      --to-email)   TO_EMAIL="$2"; shift 2 ;;
-      --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
+      --from)       [[ $# -lt 2 ]] && usage; FROM_NAMES="$2"; shift 2 ;;
+      --to-name)    [[ $# -lt 2 ]] && usage; TO_NAME="$2"; shift 2 ;;
+      --to-email)   [[ $# -lt 2 ]] && usage; TO_EMAIL="$2"; shift 2 ;;
+      --backup-dir) [[ $# -lt 2 ]] && usage; BACKUP_DIR="$2"; shift 2 ;;
+      --preview)    PREVIEW=1; shift ;;
       --) shift; break ;;
-      --*) echo "Unknown option: $1" >&2; exit 1 ;;
+      --help|-h) usage ;;
+      --*) echo "Error: Unknown option $1" >&2; usage ;;
       *) break ;;
     esac
   done
-  RANGE_SPECS=("$@")  # remaining positional args = range specs
-  [[ -n "$FROM_NAMES" ]] || { echo "--from required" >&2; exit 1; }
-  [[ -n "$TO_NAME"    ]] || { echo "--to-name required" >&2; exit 1; }
-  [[ -n "$TO_EMAIL"   ]] || { echo "--to-email required" >&2; exit 1; }
+  RANGE_SPECS=("$@")
+  [[ -n "$FROM_NAMES" ]] || { echo "Error: --from missing" >&2; usage; }
+  [[ -n "$TO_NAME"    ]] || { echo "Error: --to-name missing" >&2; usage; }
+  [[ -n "$TO_EMAIL"   ]] || { echo "Error: --to-email missing" >&2; usage; }
 }
 
-build_from_list() {
+build_match_lists() {
+  FROM_LIST=""
+  FROM_EMAIL_LIST=""
   IFS=',' read -r -a arr <<< "$FROM_NAMES"
-  local out=""
-  for n in "${arr[@]}"; do
-    local t
-    t="$(echo "$n" | sed 's/^ *//;s/ *$//')"
-    [[ -n "$t" ]] && out+="$t"$'\n'
+  for tok in "${arr[@]}"; do
+    # trim surrounding whitespace
+    t="$(echo "$tok" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    [[ -z "$t" ]] && continue
+    if [[ "$t" =~ <[^>]+> ]]; then
+      # "Name <email>"
+      name="${t%%<*}"
+      name="$(echo "$name" | sed -E 's/[[:space:]]+$//')"
+      email="$(echo "$t" | sed -E 's/.*<([^>]+)>.*/\1/')"
+      [[ -n "$name"  ]] && FROM_LIST+="$name"$'\n'
+      [[ -n "$email" ]] && FROM_EMAIL_LIST+="$email"$'\n'
+    elif [[ "$t" == *"@"* ]]; then
+      # email only
+      FROM_EMAIL_LIST+="$t"$'\n'
+    else
+      # name only
+      FROM_LIST+="$t"$'\n'
+    fi
   done
-  [[ -n "$out" ]] || { echo "No valid names parsed from --from" >&2; exit 1; }
-  FROM_LIST="$out"
+  [[ -n "$FROM_LIST$FROM_EMAIL_LIST" ]] || { echo "Error: No valid names/emails parsed from --from" >&2; exit 1; }
+}
+
+# Build an anchored OR-regex from a newline list (returns empty if list empty)
+or_regex_from_list() {
+  local data="$1"
+  local out=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # escape regex metacharacters
+    local esc
+    esc="$(printf '%s' "$line" | sed -E 's/([][(){}.^$+*?|\\])/\\\1/g')"
+    if [[ -z "$out" ]]; then out="$esc"; else out="$out|$esc"; fi
+  done <<< "$data"
+  [[ -n "$out" ]] && printf '^(%s)$' "$out" || true
 }
 
 allocate_backup_dir() {
@@ -103,7 +158,7 @@ allocate_backup_dir() {
     return
   fi
   local top repo i=1 cand
-  top="$(git rev-parse --show-toplevel)"
+  top="$(runx git rev-parse --show-toplevel | tail -n1)"
   repo="$(basename "$top")"
   while :; do
     cand="../${repo}.rewrite-backup.${i}"
@@ -113,8 +168,50 @@ allocate_backup_dir() {
 }
 
 mirror_backup() {
-  echo "Backup directory: $BACKUP_DIR"
-  git clone --mirror . "$BACKUP_DIR" || true
+  echo "Creating mirror backup at: $BACKUP_DIR"
+  runx git clone --mirror . "$BACKUP_DIR" || true
+}
+
+preview_matches() {
+  local rev_args=()
+  if [[ ${#RANGE_SPECS[@]} -gt 0 ]]; then
+    rev_args=("${RANGE_SPECS[@]}")
+    echo "Preview range specs: ${RANGE_SPECS[*]}"
+  else
+    rev_args=(--all)
+    echo "Preview over full history."
+  fi
+
+  local name_re email_re
+  name_re="$(or_regex_from_list "$FROM_LIST" || true)"
+  email_re="$(or_regex_from_list "$FROM_EMAIL_LIST" || true)"
+
+  local tmp
+  tmp="$(mktemp -t rewrite-authors-preview.XXXXXX)"
+  trap 'rm -f "$tmp"' EXIT
+
+  if [[ -n "${name_re:-}" ]]; then
+    runx git log "${rev_args[@]}" --no-decorate --no-color \
+      --author="$name_re" --pretty='%h %an <%ae> | %cI | %s' >>"$tmp"
+    runx git log "${rev_args[@]}" --no-decorate --no-color \
+      --committer="$name_re" --pretty='%h %an <%ae> | %cI | %s' >>"$tmp"
+  fi
+  if [[ -n "${email_re:-}" ]]; then
+    runx git log "${rev_args[@]}" --no-decorate --no-color \
+      --author="$email_re" --pretty='%h %an <%ae> | %cI | %s' >>"$tmp"
+    runx git log "${rev_args[@]}" --no-decorate --no-color \
+      --committer="$email_re" --pretty='%h %an <%ae> | %cI | %s' >>"$tmp"
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    echo "Preview: no matching commits found."
+    return
+  fi
+
+  local count
+  count="$(sort -u "$tmp" | wc -l | tr -d ' ')"
+  echo "Preview: matching commits ($count)"
+  sort -u "$tmp"
 }
 
 run_filter_branch() {
@@ -126,8 +223,8 @@ run_filter_branch() {
     rev_args=(--all)
     echo "No range specs (full history)."
   fi
-
-  git filter-branch --env-filter "
+  runx git filter-branch --env-filter "
+# Match by exact name(s)
 while IFS= read -r SRC; do
   [ -z \"\$SRC\" ] && continue
   if [ \"\$GIT_AUTHOR_NAME\" = \"\$SRC\" ]; then
@@ -141,35 +238,60 @@ while IFS= read -r SRC; do
 done <<'NAMES'
 ${FROM_LIST}
 NAMES
+
+# Match by exact email(s)
+while IFS= read -r SRC; do
+  [ -z \"\$SRC\" ] && continue
+  if [ \"\$GIT_AUTHOR_EMAIL\" = \"\$SRC\" ]; then
+    GIT_AUTHOR_NAME='${TO_NAME}'
+    GIT_AUTHOR_EMAIL='${TO_EMAIL}'
+  fi
+  if [ \"\$GIT_COMMITTER_EMAIL\" = \"\$SRC\" ]; then
+    GIT_COMMITTER_NAME='${TO_NAME}'
+    GIT_COMMITTER_EMAIL='${TO_EMAIL}'
+  fi
+done <<'EMAILS'
+${FROM_EMAIL_LIST}
+EMAILS
 " --tag-name-filter cat -- "${rev_args[@]}"
 }
 
 cleanup_repository() {
-  rm -rf .git/refs/original || true
-  git for-each-ref --format='%(refname)' refs/original | xargs -r -n1 git update-ref -d || true
-  git reflog expire --expire=now --all
-  git gc --prune=now --aggressive
+  runx rm -rf .git/refs/original || true
+  runx bash -c "git for-each-ref --format='%(refname)' refs/original | xargs -r -n1 git update-ref -d" || true
+  runx git reflog expire --expire=now --all
+  runx git gc --prune=now --aggressive
 }
 
 verify() {
-  echo "Old author names remaining (author field):"
-  git log --all --pretty='%an' | grep -Fx -f <(printf '%s' "$FROM_LIST" | sed '/^$/d') | wc -l || true
-  echo "Old committer names remaining (committer field):"
-  git log --all --pretty='%cn' | grep -Fx -f <(printf '%s' "$FROM_LIST" | sed '/^$/d') | wc -l || true
+  echo "Remaining (author name) matches:"
+  runx bash -c "git log --all --pretty='%an' | grep -Fx -f <(printf '%s' \"$FROM_LIST\" | sed '/^$/d') | wc -l" || true
+  echo "Remaining (committer name) matches:"
+  runx bash -c "git log --all --pretty='%cn' | grep -Fx -f <(printf '%s' \"$FROM_LIST\" | sed '/^$/d') | wc -l" || true
+  echo "Remaining (author email) matches:"
+  runx bash -c "git log --all --pretty='%ae' | grep -Fx -f <(printf '%s' \"$FROM_EMAIL_LIST\" | sed '/^$/d') | wc -l" || true
+  echo "Remaining (committer email) matches:"
+  runx bash -c "git log --all --pretty='%ce' | grep -Fx -f (printf '%s' \"$FROM_EMAIL_LIST\" | sed '/^$/d') | wc -l" || true
   echo "Sample rewritten commits:"
-  git log --all --author="$TO_NAME" --pretty='%h %an <%ae>' | head || true
+  runx git log --all --author="$TO_NAME" --pretty='%h %an <%ae>' | head || true
 }
 
 echo_push_instruction() {
   echo
-  echo "To publish rewritten history run:"
+  echo "To publish rewritten history run (manual step):"
   echo "git push --force-with-lease origin main --tags"
   echo
 }
 
 main() {
   parse_args "$@"
-  build_from_list
+  build_match_lists
+
+  if [[ $PREVIEW -eq 1 ]]; then
+    preview_matches
+    exit 0
+  fi
+
   allocate_backup_dir
   mirror_backup
   run_filter_branch
