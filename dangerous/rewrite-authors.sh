@@ -28,10 +28,10 @@
 #     main ^feature         commits in main excluding those in feature
 #
 # Options (ALL required except --backup-dir):
-#   --from "<selector>[,<selector>...]"  selectors to rewrite; each selector may be:
+#   --from "<selector>[,<selector>...]"  each selector may be:
 #       - Name
 #       - email@example.com
-#       - Name <email@example.com>
+#     Note: the "Name <email>" form is NOT supported.
 #   --to-name NEW_NAME           replacement author/committer name
 #   --to-email NEW_EMAIL         replacement email
 #   --backup-dir PATH            (optional) override backup mirror directory
@@ -40,14 +40,6 @@
 # Backup (if --backup-dir omitted):
 #   ../<repo>.rewrite-backup.<n>  first unused positive integer n.
 #
-# Examples:
-#   Full history:
-#     bash scripts/rewrite-authors.sh --from "David May,david@example.com" --to-name davfive --to-email davfive@gmail.com
-#   Range-limited:
-#     bash scripts/rewrite-authors.sh --from "David May <david@example.com>" --to-name davfive --to-email davfive@gmail.com v3.0.0-alpha..
-#
-# Afterward (manual push):
-#   git push --force-with-lease origin main --tags
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -62,7 +54,7 @@ Usage:
   rewrite-authors.sh --from "sel1,sel2" --to-name NEW_NAME --to-email NEW_EMAIL [--backup-dir PATH] [--preview] [<rev/range> ...]
 
 --from selectors:
-  Each selector may be a Name, an email, or "Name <email>"
+  Each selector may be a Name or an email. The "Name <email>" form is not supported.
 
 Required:
   --from        Comma-separated selectors to match (name/email)
@@ -75,6 +67,12 @@ Optional:
 
 Positional revision/range specs (optional):
   Examples: v1.0.0..  tagA..tagB  A..B  main  main ^feature
+
+Examples:
+  Full history:
+    bash scripts/rewrite-authors.sh --from "David May,david@example.com" --to-name davfive --to-email davfive@gmail.com
+  Range-limited:
+    bash scripts/rewrite-authors.sh --from "david@example.com" --to-name davfive --to-email davfive@gmail.com v3.0.0-alpha..
 
 Afterward (manual push):
   git push --force-with-lease origin main --tags
@@ -116,19 +114,18 @@ parse_args() {
 build_match_lists() {
   FROM_LIST=""
   FROM_EMAIL_LIST=""
+  local -a arr
   IFS=',' read -r -a arr <<< "$FROM_NAMES"
   for tok in "${arr[@]}"; do
     # trim surrounding whitespace
+    local t
     t="$(echo "$tok" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
     [[ -z "$t" ]] && continue
-    if [[ "$t" =~ <[^>]+> ]]; then
-      # "Name <email>"
-      name="${t%%<*}"
-      name="$(echo "$name" | sed -E 's/[[:space:]]+$//')"
-      email="$(echo "$t" | sed -E 's/.*<([^>]+)>.*/\1/')"
-      [[ -n "$name"  ]] && FROM_LIST+="$name"$'\n'
-      [[ -n "$email" ]] && FROM_EMAIL_LIST+="$email"$'\n'
-    elif [[ "$t" == *"@"* ]]; then
+    if [[ "$t" == *"<"* || "$t" == *">"* ]]; then
+      echo 'Error: "Name <email>" syntax is not supported; pass name or email only.' >&2
+      exit 1
+    fi
+    if [[ "$t" == *"@"* ]]; then
       # email only
       FROM_EMAIL_LIST+="$t"$'\n'
     else
@@ -188,7 +185,7 @@ preview_matches() {
 
   local tmp
   tmp="$(mktemp -t rewrite-authors-preview.XXXXXX)"
-  trap 'rm -f "$tmp"' EXIT
+  trap 'rm -f "${tmp-}"' EXIT
 
   if [[ -n "${name_re:-}" ]]; then
     runx git log "${rev_args[@]}" --no-decorate --no-color \
@@ -271,7 +268,7 @@ verify() {
   echo "Remaining (author email) matches:"
   runx bash -c "git log --all --pretty='%ae' | grep -Fx -f <(printf '%s' \"$FROM_EMAIL_LIST\" | sed '/^$/d') | wc -l" || true
   echo "Remaining (committer email) matches:"
-  runx bash -c "git log --all --pretty='%ce' | grep -Fx -f (printf '%s' \"$FROM_EMAIL_LIST\" | sed '/^$/d') | wc -l" || true
+  runx bash -c "git log --all --pretty='%ce' | grep -Fx -f <(printf '%s' \"$FROM_EMAIL_LIST\" | sed '/^$/d') | wc -l" || true
   echo "Sample rewritten commits:"
   runx git log --all --author="$TO_NAME" --pretty='%h %an <%ae>' | head || true
 }
