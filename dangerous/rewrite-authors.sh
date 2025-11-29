@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+echo  "** NOT CONFIRMED FULLY WORKING. DO NOT USE (OR USE ON A FORCE UNTIL YOU ARE SURE) **" >&2
+echo  "** UPDATED (BUT NOT TESTED) TO NOT BLOW AWAY UNFETCHED REMOTE BRANCHES **" >&2
+echo  "** IF ALL YOU WANT IS MAIN THEN USE IN CONJUNCTION WITH extract-main-branch.sh TO CREATE NEW REPO **" > 2&1
+echo  "** BUT DO NOT RUN MANUAL COMMANDS AT THE END. ONLY RUN THE SCRIPT THEN RUN extract-main-branch.sh **" > 2&1
+exit 1
 # filepath: /Users/davidmay/davfive/scripts/rewrite-authors.sh
 # -----------------------------------------------------------------------------
 # rewrite-authors.sh
@@ -145,6 +150,25 @@ mirror_backup() {
   runx git clone --mirror . "$BACKUP_DIR"
 }
 
+fetch_all_branches() {
+  echo "Fetching all remote branches and tags..."
+  
+  # Because: ensure all remote branches exist locally before rewriting
+  runx git fetch --all --tags
+  
+  # Because: create local tracking branches for all remote branches
+  git for-each-ref --format='%(refname:short)' refs/remotes/origin | grep -v 'HEAD' | while read remote_branch; do
+    local branch="${remote_branch#origin/}"
+    if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+      echo "Creating local branch: $branch"
+      git branch "$branch" "origin/$branch"
+    fi
+  done
+  
+  echo "Local branches after fetch:"
+  git branch -a
+}
+
 preview_matches() {
   echo "Preview: commits to be rewritten"
   local tmp all
@@ -272,10 +296,6 @@ post_rewrite_local_cleanup() {
   echo
   echo "Running automated local cleanup..."
   
-  # Because: fetch updates remote-tracking refs without modifying remote
-  echo "Fetching from remote..."
-  runx git fetch --all --tags || echo "Warning: fetch failed; continuing anyway"
-  
   # Because: verify locally that old identities are gone
   echo "Final verification check..."
   local check_failed=0
@@ -355,16 +375,20 @@ echo_push_instruction() {
   echo "Local rewrite complete!"
   echo "=========================================="
   echo
-  echo "To push rewritten history to remote, run:"
+  echo "To push rewritten history to remote, copy and run:"
   echo
   
+  cat <<'PUSHHEADER'
+set -euxo pipefail
+
+PUSHHEADER
+
   # Check for conflicting tags
   local conflicting_tags
   conflicting_tags="$(build_tag_conflict_list)"
   
   if [[ -n "$conflicting_tags" ]]; then
-    echo "# Because: these tags point to rewritten commits and will conflict"
-    echo "# Delete conflicting tags on remote first:"
+    echo "# Because: these tags point to rewritten commits and will conflict on remote"
     while IFS= read -r tag; do
       [[ -z "$tag" ]] && continue
       echo "git push --delete origin '$tag' || true"
@@ -373,13 +397,16 @@ echo_push_instruction() {
   fi
   
   cat <<'PUSHSCRIPT'
-# Because: force-push rewritten main branch to GitHub
-git push --force-with-lease origin main
+# Because: force-push each local branch explicitly to overwrite remote
+for branch in $(git for-each-ref --format='%(refname:short)' refs/heads); do
+  echo "Pushing $branch..."
+  git push --force origin "$branch:$branch"
+done
 
 PUSHSCRIPT
 
   if [[ -n "$conflicting_tags" ]]; then
-    echo "# Because: re-push the updated tags after deleting conflicts"
+    echo "# Because: re-push updated tags after deleting conflicts"
     while IFS= read -r tag; do
       [[ -z "$tag" ]] && continue
       echo "git push origin '$tag'"
@@ -388,8 +415,11 @@ PUSHSCRIPT
   fi
 
   cat <<'PUSHSCRIPT'
-# Because: push all remaining tags
-git push --tags
+# Because: push all tags
+git push --force --tags
+
+# Because: restore remote-tracking refs with new SHAs
+git fetch --all --tags
 
 PUSHSCRIPT
 
@@ -409,6 +439,7 @@ main() {
 
   allocate_backup_dir
   mirror_backup
+  fetch_all_branches
   run_rewrite
   verify
   post_rewrite_local_cleanup
