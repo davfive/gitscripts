@@ -16,6 +16,11 @@
 #   - Collaborators: must reset/rebase to new history (or reclone).
 #   - Scripts/docs: any hardcoded SHAs become stale.
 #   - Submodules: if this repo is a submodule, parent repos must update pointers.
+#   - ** remote push can fail with "would clobber existing tag" if a tag
+#     points at an old commit. Delete the remote tag and push the updated local tag:
+#       git push --delete origin <tag>
+#       git push origin <tag>
+#     Or recreate the tag at the desired commit locally, then push.
 #
 # Scope (optional revision/range limiting):
 #   Positional arguments AFTER the options are passed directly to git (same
@@ -67,12 +72,6 @@ Optional:
 
 Positional revision/range specs (optional):
   Examples: v1.0.0..  tagA..tagB  A..B  main  main ^feature
-
-Examples:
-  Full history:
-    bash scripts/rewrite-authors.sh --from "David May,david@example.com" --to-name davfive --to-email davfive@gmail.com
-  Range-limited:
-    bash scripts/rewrite-authors.sh --from "david@example.com" --to-name davfive --to-email davfive@gmail.com v3.0.0-alpha..
 
 Afterward (manual push):
   git push --force-with-lease origin main --tags
@@ -126,28 +125,12 @@ build_match_lists() {
       exit 1
     fi
     if [[ "$t" == *"@"* ]]; then
-      # email only
       FROM_EMAIL_LIST+="$t"$'\n'
     else
-      # name only
       FROM_LIST+="$t"$'\n'
     fi
   done
   [[ -n "$FROM_LIST$FROM_EMAIL_LIST" ]] || { echo "Error: No valid names/emails parsed from --from" >&2; exit 1; }
-}
-
-# Build an anchored OR-regex from a newline list (returns empty if list empty)
-or_regex_from_list() {
-  local data="$1"
-  local out=""
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    # escape regex metacharacters
-    local esc
-    esc="$(printf '%s' "$line" | sed -E 's/([][(){}.^$+*?|\\])/\\\1/g')"
-    if [[ -z "$out" ]]; then out="$esc"; else out="$out|$esc"; fi
-  done <<< "$data"
-  [[ -n "$out" ]] && printf '^(%s)$' "$out" || true
 }
 
 allocate_backup_dir() {
@@ -169,6 +152,19 @@ mirror_backup() {
   runx git clone --mirror . "$BACKUP_DIR" || true
 }
 
+# Build preview args: --author X --committer X for each selector (name or email)
+build_preview_args() {
+  PREVIEW_ARGS=()
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    PREVIEW_ARGS+=( "--author=$n" "--committer=$n" )
+  done <<< "$FROM_LIST"
+  while IFS= read -r e; do
+    [[ -z "$e" ]] && continue
+    PREVIEW_ARGS+=( "--author=$e" "--committer=$e" )
+  done <<< "$FROM_EMAIL_LIST"
+}
+
 preview_matches() {
   local rev_args=()
   if [[ ${#RANGE_SPECS[@]} -gt 0 ]]; then
@@ -179,25 +175,30 @@ preview_matches() {
     echo "Preview over full history."
   fi
 
-  local name_re email_re
-  name_re="$(or_regex_from_list "$FROM_LIST" || true)"
-  email_re="$(or_regex_from_list "$FROM_EMAIL_LIST" || true)"
-
-  local tmp
+  # Collect exact fields, then filter by exact name/email lists
+  local tmp all
   tmp="$(mktemp -t rewrite-authors-preview.XXXXXX)"
-  trap 'rm -f "${tmp-}"' EXIT
+  all="$(mktemp -t rewrite-authors-all.XXXXXX)"
+  trap 'rm -f "${tmp-}" "${all-}"' EXIT
 
-  if [[ -n "${name_re:-}" ]]; then
-    runx git log "${rev_args[@]}" --no-decorate --no-color \
-      --author="$name_re" --pretty='%h %an <%ae> | %cI | %s' >>"$tmp"
-    runx git log "${rev_args[@]}" --no-decorate --no-color \
-      --committer="$name_re" --pretty='%h %an <%ae> | %cI | %s' >>"$tmp"
+  runx git log "${rev_args[@]}" --no-decorate --no-color \
+    --pretty='%h|%an|%ae|%cn|%ce|%cI|%s' >"$all"
+
+  # Match exact author/committer name
+  if [[ -n "$FROM_LIST" ]]; then
+    while IFS= read -r n; do
+      [[ -z "$n" ]] && continue
+      grep -F "|${n}|" "$all" >>"$tmp"            # author name match
+      awk -F'|' -v n="$n" '$4==n' "$all" >>"$tmp" # committer name match
+    done <<< "$FROM_LIST"
   fi
-  if [[ -n "${email_re:-}" ]]; then
-    runx git log "${rev_args[@]}" --no-decorate --no-color \
-      --author="$email_re" --pretty='%h %an <%ae> | %cI | %s' >>"$tmp"
-    runx git log "${rev_args[@]}" --no-decorate --no-color \
-      --committer="$email_re" --pretty='%h %an <%ae> | %cI | %s' >>"$tmp"
+
+  # Match exact author/committer email
+  if [[ -n "$FROM_EMAIL_LIST" ]]; then
+    while IFS= read -r e; do
+      [[ -z "$e" ]] && continue
+      awk -F'|' -v e="$e" '$3==e || $5==e' "$all" >>"$tmp"
+    done <<< "$FROM_EMAIL_LIST"
   fi
 
   if [[ ! -s "$tmp" ]]; then
@@ -208,7 +209,7 @@ preview_matches() {
   local count
   count="$(sort -u "$tmp" | wc -l | tr -d ' ')"
   echo "Preview: matching commits ($count)"
-  sort -u "$tmp"
+  sort -u "$tmp" | awk -F'|' '{ printf "%s %s <%s> | %s | %s\n", $1, $2, $3, $6, $7 }'
 }
 
 run_filter_branch() {
